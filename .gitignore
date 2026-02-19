@@ -1,0 +1,6 @@
+/target
+.env
+*.wav
+project.lua
+.DS_Store
+CLAUDE.md
