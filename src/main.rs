@@ -17,7 +17,7 @@ use std::thread;
 use std::time::Duration;
 
 /// Minimum utterance length before we bother transcribing.
-const MIN_CHUNK_SAMPLES: usize = 32_000; // 2s at 16kHz
+const MIN_CHUNK_SAMPLES: usize = 8_000; // 0.5s at 16kHz
 
 /// How often to poll the audio buffer for VAD.
 const VAD_POLL_INTERVAL: Duration = Duration::from_millis(32);

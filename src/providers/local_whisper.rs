@@ -19,10 +19,16 @@ use crate::providers::transcription::{
 /// Model's expected sample rate (16kHz for Whisper).
 const MODEL_SAMPLE_RATE: u32 = 16_000;
 
-/// Beam search width (Whisper default is 5).
-const BEAM_WIDTH: usize = 5;
 /// Maximum decoder tokens before stopping.
 const MAX_DECODE_TOKENS: usize = 224;
+
+/// Temperature schedule for fallback decoding (OpenAI Whisper default).
+/// Try greedy first (0.0), escalate on degenerate output.
+const TEMPERATURE_SCHEDULE: &[f32] = &[0.0, 0.2, 0.4, 0.6, 0.8];
+
+/// Compression ratio threshold — if token count / unique token count exceeds this,
+/// the output is considered degenerate (excessive repetition).
+const MAX_COMPRESSION_RATIO: f32 = 2.4;
 
 /// RMS below this threshold is treated as silence — skip inference entirely.
 const SILENCE_RMS_THRESHOLD: f32 = 0.003;
@@ -257,64 +263,188 @@ impl PulseEngine {
             }
         }
 
-        // Reset KV cache before new inference.
-        self.model.reset_kv_cache();
+        // 6. Compute mel spectrogram for the full audio.
+        // pcm_to_mel pads the audio internally, so total_frames may exceed
+        // the actual content length. Track the real content boundary.
+        let content_frames_from_pcm = trimmed.len() / m::HOP_LENGTH;
+        let mel_all = m::audio::pcm_to_mel(&self.config, &trimmed, &self.mel_filters);
+        let total_frames = mel_all.len() / self.config.num_mel_bins;
 
-        // 6. Compute mel spectrogram.
-        let mel = m::audio::pcm_to_mel(&self.config, &trimmed, &self.mel_filters);
-        let n_frames = mel.len() / self.config.num_mel_bins;
-        let mel = Tensor::from_vec(mel, (1, self.config.num_mel_bins, n_frames), &self.device)
-            .map_err(|e| Error::Transcription(format!("Mel tensor: {}", e)))?;
+        // Build full mel tensor: shape (1, num_mel_bins, total_frames).
+        let mel_full = Tensor::from_vec(
+            mel_all,
+            (1, self.config.num_mel_bins, total_frames),
+            &self.device,
+        )
+        .map_err(|e| Error::Transcription(format!("Mel tensor: {}", e)))?;
 
-        // Pad or trim to N_FRAMES (3000) frames.
-        let mel = pad_or_trim(&mel, m::N_FRAMES, &self.device)
-            .map_err(|e| Error::Transcription(format!("Mel pad/trim: {}", e)))?;
-
-        // 7. Run encoder.
-        let encoder_output = self
-            .model
-            .encoder
-            .forward(&mel, true)
-            .map_err(|e| Error::Transcription(format!("Encoder: {}", e)))?;
-
-        // 8. Beam search decoding with token suppression.
+        // Pre-compute token IDs used in decoding.
         let sot_token = token_id(&self.tokenizer, m::SOT_TOKEN);
         let eot_token = token_id(&self.tokenizer, m::EOT_TOKEN);
-        let no_timestamps_token = token_id(&self.tokenizer, m::NO_TIMESTAMPS_TOKEN);
-
-        // Build the initial decoder prompt.
-        // All models get TRANSCRIBE token to signal the task.
-        // Multilingual models additionally need a language token.
         let transcribe_token = token_id(&self.tokenizer, m::TRANSCRIBE_TOKEN);
-        let prompt_tokens: Vec<u32> = if self.is_multilingual() {
-            let en_token = token_id(&self.tokenizer, "<|en|>");
-            vec![sot_token, en_token, transcribe_token, no_timestamps_token]
-        } else {
-            vec![sot_token, transcribe_token, no_timestamps_token]
-        };
-
-        let suppress_above = no_timestamps_token;
+        let timestamp_begin = token_id(&self.tokenizer, "<|0.00|>");
         let vocab_size = self.config.vocab_size as u32;
 
-        let result_tokens = beam_search_decode(
-            &mut self.model,
-            &encoder_output,
-            &prompt_tokens,
+        // Decoder prompt with timestamps enabled (no NO_TIMESTAMPS token).
+        // The model will produce timestamp pairs: <|T_start|> text <|T_end|>
+        // which we use to compute seek offsets for accurate long-audio handling.
+        // We include <|0.00|> to kickstart timestamp generation.
+        let prompt_tokens: Vec<u32> = if self.is_multilingual() {
+            let en_token = token_id(&self.tokenizer, "<|en|>");
+            vec![sot_token, en_token, transcribe_token, timestamp_begin]
+        } else {
+            vec![sot_token, transcribe_token, timestamp_begin]
+        };
+
+        let suppress_config = SuppressionConfig {
             eot_token,
-            suppress_above,
+            timestamp_begin,
             vocab_size,
-            &self.device,
-            BEAM_WIDTH,
-            MAX_DECODE_TOKENS,
-        )?;
+        };
 
-        // 9. Decode tokens to text.
-        let text = self
-            .tokenizer
-            .decode(&result_tokens, true)
-            .map_err(|e| Error::Transcription(format!("Token decode: {}", e)))?;
+        // input_stride: encoder conv downsamples 3000 mel frames → 1500 encoder tokens.
+        // Each timestamp position = 2 mel frames = 0.02 seconds.
+        const INPUT_STRIDE: usize = 2;
 
-        Ok(text.trim().to_string())
+        // 7. Seek-based sliding window (OpenAI Whisper approach).
+        //    Instead of fixed 30s strides, the model's timestamp tokens tell us
+        //    exactly how far it consumed. We seek to that position for the next window.
+        let mut all_text_parts: Vec<String> = Vec::new();
+        let mut seek: usize = 0;
+
+        // content_frames tracks the real audio length (before pcm_to_mel padding).
+        // total_frames may be larger due to padding to N_SAMPLES multiples.
+        let content_frames = content_frames_from_pcm;
+
+        // Minimum real frames to bother transcribing a segment (~0.5s at 100 frames/s).
+        const MIN_SEGMENT_FRAMES: usize = 50;
+
+        while seek < content_frames {
+            let segment_frames = (content_frames - seek).min(m::N_FRAMES);
+
+            // Skip tiny trailing segments — they're mostly padding and produce hallucinations.
+            if segment_frames < MIN_SEGMENT_FRAMES {
+                break;
+            }
+
+            // Extract this segment's mel frames.
+            let mel_segment = mel_full
+                .narrow(2, seek, segment_frames)
+                .map_err(|e| Error::Transcription(format!("Mel narrow: {}", e)))?;
+
+            // Pad short segments to N_FRAMES (Whisper expects exactly 3000 frames).
+            let mel = pad_or_trim(&mel_segment, m::N_FRAMES, &self.device)
+                .map_err(|e| Error::Transcription(format!("Mel pad/trim: {}", e)))?;
+
+            // Reset KV cache for each segment.
+            self.model.reset_kv_cache();
+
+            // Run encoder.
+            let encoder_output = self
+                .model
+                .encoder
+                .forward(&mel, true)
+                .map_err(|e| Error::Transcription(format!("Encoder: {}", e)))?;
+
+            // Greedy decoding with temperature fallback.
+            let mut result_tokens = Vec::new();
+            for &temperature in TEMPERATURE_SCHEDULE {
+                result_tokens = greedy_decode(
+                    &mut self.model,
+                    &encoder_output,
+                    &prompt_tokens,
+                    eot_token,
+                    &suppress_config,
+                    &self.device,
+                    temperature,
+                )?;
+
+                if !is_degenerate(&result_tokens) {
+                    break;
+                }
+                debug!(
+                    "[decode] degenerate output at temperature {}, retrying",
+                    temperature
+                );
+            }
+
+            // Find the last timestamp token to compute seek advance.
+            let timestamp_tokens: Vec<u32> = result_tokens
+                .iter()
+                .filter(|&&t| t >= timestamp_begin)
+                .copied()
+                .collect();
+            let last_timestamp_pos = timestamp_tokens
+                .last()
+                .map(|&t| (t - timestamp_begin) as usize);
+
+            debug!(
+                "[seek] frame {} ({:.1}s), {} tokens, {} timestamps, last_ts_pos={:?}",
+                seek,
+                seek as f64 * m::HOP_LENGTH as f64 / m::SAMPLE_RATE as f64,
+                result_tokens.len(),
+                timestamp_tokens.len(),
+                last_timestamp_pos,
+            );
+
+            let seek_advance = if let Some(ts_pos) = last_timestamp_pos {
+                (ts_pos * INPUT_STRIDE).max(1)
+            } else {
+                segment_frames
+            };
+
+            // Filter out timestamp tokens, keep only text tokens for output.
+            // For padded segments (last segment), only include text tokens that
+            // appear before timestamps pointing past the real content — this
+            // prevents hallucinations like "[Music]" from the zero-padded tail.
+            let content_ts_limit = if segment_frames < m::N_FRAMES {
+                // Max timestamp position that's within real audio.
+                Some((segment_frames / INPUT_STRIDE) as u32 + timestamp_begin)
+            } else {
+                None
+            };
+
+            let mut text_tokens: Vec<u32> = Vec::new();
+            for &t in &result_tokens {
+                if let Some(limit) = content_ts_limit {
+                    if t >= limit {
+                        // This timestamp (or anything after) is in padded silence.
+                        break;
+                    }
+                }
+                if t < timestamp_begin {
+                    text_tokens.push(t);
+                }
+            }
+
+            if !text_tokens.is_empty() {
+                let segment_text = self
+                    .tokenizer
+                    .decode(&text_tokens, true)
+                    .map_err(|e| Error::Transcription(format!("Token decode: {}", e)))?;
+
+                let segment_text = segment_text.trim().to_string();
+                if !segment_text.is_empty() {
+                    debug!(
+                        "[segment] seek {}: \"{}\"",
+                        seek,
+                        &segment_text[..segment_text.len().min(60)]
+                    );
+                    all_text_parts.push(segment_text);
+                }
+            }
+
+            // If this segment had to be padded (fewer real frames than N_FRAMES),
+            // it's the last segment with real audio. Stop here to avoid
+            // hallucinations from decoding padded silence.
+            if segment_frames < m::N_FRAMES {
+                break;
+            }
+
+            seek += seek_advance;
+        }
+
+        Ok(all_text_parts.join(" "))
     }
 }
 
@@ -362,133 +492,174 @@ impl TranscriptionProvider for LocalPulseProvider {
 
 // ── Helpers ───────────────────────────────────────────────────────
 
-/// Beam search decoding for Whisper.
+/// Token suppression configuration.
 ///
-/// Maintains `beam_width` hypotheses in parallel, expanding each by the top
-/// candidates at every step. Since Candle's decoder has a single internal KV
-/// cache, we reset it and recompute from the full token sequence for each beam
-/// at each step. The encoder output (the expensive part) is computed once and
-/// shared across all beams.
-fn beam_search_decode(
+/// Whisper's vocab layout: [text tokens] [EOT] [SOT] [languages...] [tasks...] [NO_TIMESTAMPS] [timestamps...]
+/// We suppress the special tokens between EOT and timestamp_begin (SOT, languages, tasks, NO_TIMESTAMPS)
+/// but allow text tokens, EOT, and timestamp tokens through.
+struct SuppressionConfig {
+    eot_token: u32,
+    timestamp_begin: u32,
+    vocab_size: u32,
+}
+
+impl SuppressionConfig {
+    /// Returns true if this token should be allowed during decoding.
+    fn is_allowed(&self, id: u32) -> bool {
+        if id >= self.vocab_size {
+            return false;
+        }
+        if id == self.eot_token {
+            return true;
+        }
+        // Allow text tokens (below EOT).
+        if id < self.eot_token {
+            return true;
+        }
+        // Allow timestamp tokens.
+        if id >= self.timestamp_begin {
+            return true;
+        }
+        // Suppress everything in between (SOT, language tokens, task tokens, NO_TIMESTAMPS).
+        false
+    }
+}
+
+/// Greedy decoding with optional temperature sampling and token suppression.
+///
+/// At temperature 0, uses argmax (pure greedy). At temperature > 0, applies
+/// softmax(logits / temperature) and samples from the distribution. Uses
+/// KV-cached incremental decoding for speed — only the prompt is processed
+/// in full on the first step, then one token at a time.
+fn greedy_decode(
     model: &mut m::model::Whisper,
     encoder_output: &Tensor,
     prompt_tokens: &[u32],
     eot_token: u32,
-    suppress_above: u32,
-    vocab_size: u32,
+    suppress: &SuppressionConfig,
     device: &Device,
-    beam_width: usize,
-    max_tokens: usize,
+    temperature: f32,
 ) -> Result<Vec<u32>> {
-    let prompt_len = prompt_tokens.len();
+    model.reset_kv_cache();
 
-    // Each beam: (token_sequence, cumulative_log_prob).
-    let mut beams: Vec<(Vec<u32>, f64)> = vec![(prompt_tokens.to_vec(), 0.0)];
-    let mut completed: Vec<(Vec<u32>, f64)> = Vec::new();
+    let mut tokens = prompt_tokens.to_vec();
+    let mut result_tokens: Vec<u32> = Vec::new();
 
-    for _ in 0..max_tokens {
-        let mut candidates: Vec<(Vec<u32>, f64)> = Vec::new();
+    for _ in 0..MAX_DECODE_TOKENS {
+        let token_tensor = Tensor::new(tokens.as_slice(), device)
+            .map_err(|e| Error::Transcription(format!("Token tensor: {}", e)))?
+            .unsqueeze(0)
+            .map_err(|e| Error::Transcription(format!("Unsqueeze: {}", e)))?;
 
-        for (tokens, cum_log_prob) in &beams {
-            // Reset KV cache and run the full sequence for this beam.
-            model.reset_kv_cache();
+        let flush = result_tokens.is_empty();
+        let hidden = model
+            .decoder
+            .forward(&token_tensor, encoder_output, flush)
+            .map_err(|e| Error::Transcription(format!("Decoder: {}", e)))?;
 
-            let token_tensor = Tensor::new(tokens.as_slice(), device)
-                .and_then(|t| t.unsqueeze(0))
-                .map_err(|e| Error::Transcription(format!("Token tensor: {}", e)))?;
+        let logits = model
+            .decoder
+            .final_linear(&hidden)
+            .map_err(|e| Error::Transcription(format!("Final linear: {}", e)))?;
 
-            let hidden = model
-                .decoder
-                .forward(&token_tensor, encoder_output, true)
-                .map_err(|e| Error::Transcription(format!("Decoder: {}", e)))?;
+        let seq_len = tokens.len();
+        let last_logits = logits
+            .i((0, seq_len - 1))
+            .map_err(|e| Error::Transcription(format!("Logit indexing: {}", e)))?;
 
-            let logits = model
-                .decoder
-                .final_linear(&hidden)
-                .map_err(|e| Error::Transcription(format!("Final linear: {}", e)))?;
+        let logits_vec: Vec<f32> = last_logits
+            .to_vec1::<f32>()
+            .map_err(|e| Error::Transcription(format!("Logits to vec: {}", e)))?;
 
-            // Extract logits for the last position and compute log-probabilities.
-            let last_logits = logits
-                .i((0, tokens.len() - 1))
-                .map_err(|e| Error::Transcription(format!("Logit indexing: {}", e)))?;
+        let next_token = if temperature <= 0.0 {
+            suppressed_argmax(&logits_vec, suppress)
+        } else {
+            sample_with_temperature(&logits_vec, suppress, temperature)
+        };
 
-            let logits_vec: Vec<f32> = last_logits
-                .to_vec1::<f32>()
-                .map_err(|e| Error::Transcription(format!("Logits to vec: {}", e)))?;
-
-            // Stable log-softmax: log_prob = x - log(sum(exp(x - max)))  - max.
-            let max_logit = logits_vec
-                .iter()
-                .take(vocab_size as usize)
-                .cloned()
-                .fold(f32::NEG_INFINITY, f32::max);
-            let log_sum_exp: f64 = logits_vec
-                .iter()
-                .take(vocab_size as usize)
-                .map(|&x| ((x - max_logit) as f64).exp())
-                .sum::<f64>()
-                .ln()
-                + max_logit as f64;
-
-            // Collect valid tokens with their log-probabilities, pick top beam_width.
-            let mut scored: Vec<(u32, f64)> = logits_vec
-                .iter()
-                .enumerate()
-                .filter(|&(id, _)| {
-                    let id = id as u32;
-                    id < vocab_size && (id <= suppress_above || id == eot_token)
-                })
-                .map(|(id, &logit)| (id as u32, logit as f64 - log_sum_exp))
-                .collect();
-
-            scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-            scored.truncate(beam_width);
-
-            for (token_id, log_prob) in scored {
-                let new_cum = cum_log_prob + log_prob;
-                let mut new_tokens = tokens.clone();
-                new_tokens.push(token_id);
-
-                if token_id == eot_token {
-                    // Length-normalize score by number of result tokens.
-                    let result_len = (new_tokens.len() - prompt_len) as f64;
-                    let normalized = new_cum / result_len.max(1.0);
-                    completed.push((new_tokens, normalized));
-                } else {
-                    candidates.push((new_tokens, new_cum));
-                }
-            }
-        }
-
-        if candidates.is_empty() {
+        if next_token == eot_token {
             break;
         }
 
-        // Keep the top beam_width candidates by cumulative log-probability.
-        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-        candidates.truncate(beam_width);
-        beams = candidates;
+        result_tokens.push(next_token);
+        tokens.push(next_token);
+    }
 
-        // Early exit if we have enough completed beams.
-        if completed.len() >= beam_width {
-            break;
+    Ok(result_tokens)
+}
+
+/// Check if decoder output is degenerate (excessive repetition).
+fn is_degenerate(tokens: &[u32]) -> bool {
+    if tokens.is_empty() {
+        return false;
+    }
+    let unique: std::collections::HashSet<u32> = tokens.iter().copied().collect();
+    let compression = tokens.len() as f32 / unique.len().max(1) as f32;
+    compression > MAX_COMPRESSION_RATIO
+}
+
+/// Argmax over logits with token suppression.
+fn suppressed_argmax(logits: &[f32], suppress: &SuppressionConfig) -> u32 {
+    let mut best_token = suppress.eot_token;
+    let mut best_logit = f32::NEG_INFINITY;
+
+    for (id, &logit) in logits.iter().enumerate() {
+        let id = id as u32;
+        if !suppress.is_allowed(id) {
+            continue;
+        }
+        if logit > best_logit {
+            best_logit = logit;
+            best_token = id;
         }
     }
 
-    // Add any incomplete beams (hit max_tokens) to the completed set.
-    for (tokens, cum_log_prob) in beams {
-        let result_len = (tokens.len() - prompt_len) as f64;
-        let normalized = cum_log_prob / result_len.max(1.0);
-        completed.push((tokens, normalized));
+    best_token
+}
+
+/// Sample from logits with temperature scaling and token suppression.
+fn sample_with_temperature(
+    logits: &[f32],
+    suppress: &SuppressionConfig,
+    temperature: f32,
+) -> u32 {
+    // Build scaled probability distribution over valid tokens.
+    let valid: Vec<(u32, f32)> = logits
+        .iter()
+        .enumerate()
+        .filter(|&(id, _)| suppress.is_allowed(id as u32))
+        .map(|(id, &logit)| (id as u32, logit / temperature))
+        .collect();
+
+    if valid.is_empty() {
+        return suppress.eot_token;
     }
 
-    // Pick the best completed beam by length-normalized score.
-    completed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    // Stable softmax.
+    let max_logit = valid.iter().map(|(_, l)| *l).fold(f32::NEG_INFINITY, f32::max);
+    let sum_exp: f64 = valid.iter().map(|(_, l)| ((*l - max_logit) as f64).exp()).sum();
+    let probs: Vec<(u32, f64)> = valid
+        .iter()
+        .map(|(id, l)| (*id, ((*l - max_logit) as f64).exp() / sum_exp))
+        .collect();
 
-    match completed.into_iter().next() {
-        Some((tokens, _)) => Ok(tokens[prompt_len..].to_vec()),
-        None => Ok(Vec::new()),
+    // Sample using a simple linear scan with a random threshold.
+    let seed_bits = logits.first().unwrap_or(&0.0).to_bits() ^ logits.len() as u32;
+    let mut rng_state = seed_bits.wrapping_mul(2654435761);
+    rng_state ^= rng_state >> 16;
+    rng_state = rng_state.wrapping_mul(2246822507);
+    rng_state ^= rng_state >> 13;
+    let threshold = (rng_state as f64) / (u32::MAX as f64);
+
+    let mut cumulative = 0.0;
+    for (id, prob) in &probs {
+        cumulative += prob;
+        if cumulative >= threshold {
+            return *id;
+        }
     }
+
+    probs.last().map(|(id, _)| *id).unwrap_or(suppress.eot_token)
 }
 
 /// Look up a special token's ID in the tokenizer.

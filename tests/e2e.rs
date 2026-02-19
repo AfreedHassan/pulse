@@ -288,6 +288,122 @@ fn test_pulse_model_parse() {
     assert_eq!(PulseModel::parse("unknown"), None);
 }
 
+/// ~100-word transcription accuracy test.
+///
+/// Uses macOS TTS to generate a passage with varied vocabulary, numbers,
+/// and natural sentence structure. Measures word-level accuracy by comparing
+/// expected vs actual words (case-insensitive, punctuation-stripped).
+///
+/// Run with: cargo test --release test_100_word_accuracy -- --ignored --nocapture
+#[test]
+#[ignore]
+fn test_100_word_accuracy() {
+    let sentences = [
+        "Yesterday morning I walked through the park and noticed the leaves were changing color.",
+        "The temperature outside was around fifty degrees, which felt perfect for a long walk.",
+        "Several children were playing near the fountain while their parents watched from wooden benches.",
+        "A small brown dog ran across the path chasing after a bright red ball.",
+        "I stopped at the corner bakery and ordered a coffee with two sugars and cream.",
+        "The woman behind the counter smiled and said it would be ready in just a minute.",
+        "While waiting I noticed a newspaper headline about new technology changing how people communicate.",
+        "After finishing my drink I continued walking toward the library on the other side of town.",
+    ];
+
+    let full_text = sentences.join(" ");
+    let expected_words: Vec<String> = normalize_words(&full_text);
+    let word_count = expected_words.len();
+    eprintln!("Test passage: {} words", word_count);
+    eprintln!("Text: \"{}\"", full_text);
+
+    // Generate speech for each sentence separately to avoid TTS issues with very long text,
+    // then concatenate with small pauses.
+    eprintln!("Generating speech via macOS TTS...");
+    let mut all_samples: Vec<f32> = Vec::new();
+    let mut sr = 0u32;
+
+    for (i, sentence) in sentences.iter().enumerate() {
+        let (samples, sample_rate) = generate_speech(sentence);
+        sr = sample_rate;
+        all_samples.extend_from_slice(&samples);
+        // Add a 300ms pause between sentences.
+        if i < sentences.len() - 1 {
+            all_samples.extend(vec![0.0f32; (sr as f64 * 0.3) as usize]);
+        }
+    }
+
+    let duration = all_samples.len() as f64 / sr as f64;
+    eprintln!("Total audio: {:.1}s at {} Hz", duration, sr);
+
+    eprintln!("Loading model...");
+    let mut engine = PulseEngine::new(PulseModel::Fast).expect("Failed to load model");
+
+    eprintln!("Transcribing...");
+    let start = std::time::Instant::now();
+    let result = engine
+        .transcribe_sync(&all_samples, sr, 1)
+        .expect("Transcription failed");
+    let elapsed = start.elapsed();
+
+    eprintln!("Transcribed in {:.1}s (RTF: {:.2}x)", elapsed.as_secs_f64(), elapsed.as_secs_f64() / duration);
+    eprintln!("Result: \"{}\"", result);
+
+    assert!(!result.is_empty(), "Transcription was empty");
+
+    let result_words = normalize_words(&result);
+    eprintln!("\nExpected {} words, got {} words", expected_words.len(), result_words.len());
+
+    // Calculate word-level accuracy using longest common subsequence.
+    let lcs_len = longest_common_subsequence(&expected_words, &result_words);
+    let accuracy = lcs_len as f64 / expected_words.len() as f64 * 100.0;
+
+    eprintln!("Word accuracy (LCS): {}/{} = {:.1}%", lcs_len, expected_words.len(), accuracy);
+
+    // Show missed words.
+    let result_set: std::collections::HashSet<&str> = result_words.iter().map(|s| s.as_str()).collect();
+    let missed: Vec<&str> = expected_words
+        .iter()
+        .filter(|w| !result_set.contains(w.as_str()))
+        .map(|s| s.as_str())
+        .collect();
+    if !missed.is_empty() {
+        let unique_missed: std::collections::HashSet<&str> = missed.into_iter().collect();
+        eprintln!("Words not found in output: {:?}", unique_missed);
+    }
+
+    // Require at least 70% word accuracy for the fast model with TTS input.
+    assert!(
+        accuracy >= 70.0,
+        "Word accuracy too low: {:.1}% (expected >= 70%)",
+        accuracy,
+    );
+
+    eprintln!("\nPASSED: {:.1}% word accuracy", accuracy);
+}
+
+/// Strip punctuation and lowercase for word comparison.
+fn normalize_words(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|w| w.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect::<String>())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// Longest common subsequence length (for word-level accuracy).
+fn longest_common_subsequence(a: &[String], b: &[String]) -> usize {
+    let (m, n) = (a.len(), b.len());
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for i in 1..=m {
+        for j in 1..=n {
+            dp[i][j] = if a[i - 1] == b[j - 1] {
+                dp[i - 1][j - 1] + 1
+            } else {
+                dp[i - 1][j].max(dp[i][j - 1])
+            };
+        }
+    }
+    dp[m][n]
+}
+
 /// Tests WAV file reading utility.
 #[test]
 fn test_read_wav_invalid() {

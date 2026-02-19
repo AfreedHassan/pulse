@@ -48,12 +48,15 @@ impl SimpleVad {
     /// Defaults:
     /// - `threshold`: 0.01 RMS (~-40 dB)
     /// - `min_speech_chunks`: 3 (~96ms at VAD_CHUNK_SIZE=512, 16kHz)
-    /// - `min_silence_chunks`: 15 (~480ms at VAD_CHUNK_SIZE=512, 16kHz)
+    /// - `min_silence_chunks`: 78 (~2.5s at VAD_CHUNK_SIZE=512, 16kHz)
+    ///
+    /// The long silence threshold ensures only deliberate pauses trigger
+    /// utterance boundaries — not natural mid-sentence gaps (~0.3-1s).
     pub fn new() -> Self {
         Self {
             threshold: 0.01,
             min_speech_chunks: 3,
-            min_silence_chunks: 15,
+            min_silence_chunks: 78,
             speech_chunk_count: 0,
             silence_chunk_count: 0,
             current_state: VoiceActivity::Silence,
