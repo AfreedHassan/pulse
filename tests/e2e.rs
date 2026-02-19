@@ -1,4 +1,5 @@
 use pulse::providers::local_whisper::{PulseEngine, PulseModel};
+use pulse::providers::moonshine::MoonshineEngine;
 use std::process::Command;
 
 /// Generate speech audio using macOS `say` + `afconvert`, return PCM samples.
@@ -335,7 +336,7 @@ fn test_100_word_accuracy() {
     eprintln!("Total audio: {:.1}s at {} Hz", duration, sr);
 
     eprintln!("Loading model...");
-    let mut engine = PulseEngine::new(PulseModel::Fast).expect("Failed to load model");
+    let mut engine = PulseEngine::new(PulseModel::Medium).expect("Failed to load model");
 
     eprintln!("Transcribing...");
     let start = std::time::Instant::now();
@@ -358,15 +359,15 @@ fn test_100_word_accuracy() {
 
     eprintln!("Word accuracy (LCS): {}/{} = {:.1}%", lcs_len, expected_words.len(), accuracy);
 
-    // Show missed words.
-    let result_set: std::collections::HashSet<&str> = result_words.iter().map(|s| s.as_str()).collect();
-    let missed: Vec<&str> = expected_words
+    // Show missed words (unique only).
+    let result_set: std::collections::HashSet<&str> =
+        result_words.iter().map(|s| s.as_str()).collect();
+    let unique_missed: std::collections::BTreeSet<&str> = expected_words
         .iter()
-        .filter(|w| !result_set.contains(w.as_str()))
         .map(|s| s.as_str())
+        .filter(|w| !result_set.contains(w))
         .collect();
-    if !missed.is_empty() {
-        let unique_missed: std::collections::HashSet<&str> = missed.into_iter().collect();
+    if !unique_missed.is_empty() {
         eprintln!("Words not found in output: {:?}", unique_missed);
     }
 
@@ -404,9 +405,377 @@ fn longest_common_subsequence(a: &[String], b: &[String]) -> usize {
     dp[m][n]
 }
 
+/// Simulates the interactive recording loop: splits audio into 5-second chunks,
+/// transcribes each independently, and joins the results — just like the
+/// timer-based drain in `run_interactive_mode`.
+///
+/// Run with: cargo test --release test_interactive_chunked -- --ignored --nocapture
+#[test]
+#[ignore]
+fn test_interactive_chunked() {
+    let sentences = [
+        "Yesterday morning I walked through the park and noticed the leaves were changing color.",
+        "The temperature outside was around fifty degrees, which felt perfect for a long walk.",
+        "Several children were playing near the fountain while their parents watched from wooden benches.",
+        "A small brown dog ran across the path chasing after a bright red ball.",
+        "I stopped at the corner bakery and ordered a coffee with two sugars and cream.",
+        "The woman behind the counter smiled and said it would be ready in just a minute.",
+        "While waiting I noticed a newspaper headline about new technology changing how people communicate.",
+        "After finishing my drink I continued walking toward the library on the other side of town.",
+    ];
+
+    let full_text = sentences.join(" ");
+    let expected_words = normalize_words(&full_text);
+    eprintln!("Test passage: {} words", expected_words.len());
+
+    // Generate audio.
+    eprintln!("Generating speech via macOS TTS...");
+    let mut all_samples: Vec<f32> = Vec::new();
+    let mut sr = 0u32;
+    for (i, sentence) in sentences.iter().enumerate() {
+        let (samples, sample_rate) = generate_speech(sentence);
+        sr = sample_rate;
+        all_samples.extend_from_slice(&samples);
+        if i < sentences.len() - 1 {
+            all_samples.extend(vec![0.0f32; (sr as f64 * 0.3) as usize]);
+        }
+    }
+    let total_duration = all_samples.len() as f64 / sr as f64;
+    eprintln!("Total audio: {:.1}s at {} Hz", total_duration, sr);
+
+    // Split into 5-second chunks (simulating CHUNK_INTERVAL timer drain).
+    let chunk_size = sr as usize * 5; // 5 seconds of samples
+    let chunks: Vec<&[f32]> = all_samples.chunks(chunk_size).collect();
+    eprintln!("Split into {} chunks of ~5s each", chunks.len());
+
+    eprintln!("Loading model...");
+    let mut engine = PulseEngine::new(PulseModel::Medium).expect("Failed to load model");
+
+    // Transcribe each chunk independently, like the interactive loop does.
+    let mut transcripts: Vec<String> = Vec::new();
+    let start = std::time::Instant::now();
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let chunk_dur = chunk.len() as f64 / sr as f64;
+        eprint!("[chunk {}] {:.1}s -> ", i, chunk_dur);
+        match engine.transcribe_sync(chunk, sr, 1) {
+            Ok(text) if !text.is_empty() => {
+                eprintln!("\"{}\"", &text[..text.len().min(80)]);
+                transcripts.push(text);
+            }
+            Ok(_) => eprintln!("(empty)"),
+            Err(e) => eprintln!("error: {}", e),
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let result = transcripts.join(" ");
+
+    eprintln!("\nTotal transcription time: {:.1}s (RTF: {:.2}x)", elapsed.as_secs_f64(), elapsed.as_secs_f64() / total_duration);
+    eprintln!("Result: \"{}\"", result);
+
+    assert!(!result.is_empty(), "Transcription was empty");
+
+    let result_words = normalize_words(&result);
+    eprintln!("\nExpected {} words, got {} words", expected_words.len(), result_words.len());
+
+    let lcs_len = longest_common_subsequence(&expected_words, &result_words);
+    let accuracy = lcs_len as f64 / expected_words.len() as f64 * 100.0;
+    eprintln!("Word accuracy (LCS): {}/{} = {:.1}%", lcs_len, expected_words.len(), accuracy);
+
+    let result_set: std::collections::HashSet<&str> =
+        result_words.iter().map(|s| s.as_str()).collect();
+    let unique_missed: std::collections::BTreeSet<&str> = expected_words
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|w| !result_set.contains(w))
+        .collect();
+    if !unique_missed.is_empty() {
+        eprintln!("Words not found in output: {:?}", unique_missed);
+    }
+
+    assert!(
+        accuracy >= 70.0,
+        "Word accuracy too low: {:.1}% (expected >= 70%)",
+        accuracy,
+    );
+
+    eprintln!("\nPASSED: {:.1}% word accuracy", accuracy);
+}
+
 /// Tests WAV file reading utility.
 #[test]
 fn test_read_wav_invalid() {
     let result = pulse::read_wav("/nonexistent/file.wav");
     assert!(result.is_err());
+}
+
+// ── Moonshine tests ───────────────────────────────────────────────
+
+/// Full end-to-end: macOS TTS → WAV → Moonshine → check output.
+///
+/// Run with: cargo test --release test_moonshine_e2e_with_tts -- --ignored --nocapture
+#[test]
+#[ignore] // requires model download, macOS, and ONNX Runtime
+fn test_moonshine_e2e_with_tts() {
+    let text = "The quick brown fox jumps over the lazy dog";
+    eprintln!("Generating speech: \"{}\"", text);
+    let (samples, sample_rate) = generate_speech(text);
+    let duration = samples.len() as f64 / sample_rate as f64;
+    eprintln!("Generated {:.1}s of audio at {} Hz", duration, sample_rate);
+
+    let max_abs = samples.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
+    assert!(
+        max_abs > 0.01,
+        "Audio appears to be silence (max={:.6})",
+        max_abs
+    );
+
+    eprintln!("Loading Moonshine Base model...");
+    let mut engine = MoonshineEngine::new().expect("Failed to load Moonshine model");
+
+    eprintln!("Transcribing...");
+    let start = std::time::Instant::now();
+    let result = engine
+        .transcribe_sync(&samples, sample_rate, 1)
+        .expect("Transcription failed");
+    let elapsed = start.elapsed();
+
+    eprintln!("Transcribed in {:.2}s (RTF: {:.3}x)", elapsed.as_secs_f64(), elapsed.as_secs_f64() / duration);
+    eprintln!("Expected: \"{}\"", text);
+    eprintln!("Got:      \"{}\"", result);
+
+    assert!(!result.is_empty(), "Transcription was empty");
+
+    let lower = result.to_lowercase();
+    let key_words = ["quick", "brown", "fox", "lazy", "dog"];
+    let matches: Vec<&str> = key_words
+        .into_iter()
+        .filter(|w| lower.contains(w))
+        .collect();
+    eprintln!("Matched {}/5 key words: {:?}", matches.len(), matches);
+    assert!(
+        matches.len() >= 3,
+        "Expected at least 3/5 key words, got {}: {:?}",
+        matches.len(),
+        matches
+    );
+}
+
+/// ~200-word transcription accuracy test with Moonshine Base using chunked decoding.
+///
+/// Moonshine Base is designed for short audio segments (~5-10s). For longer audio,
+/// we chunk into 10s segments (same as interactive mode's CHUNK_INTERVAL) and
+/// transcribe each independently, joining the results.
+///
+/// Run with: cargo test --release test_moonshine_200_word_accuracy -- --ignored --nocapture
+#[test]
+#[ignore]
+fn test_moonshine_200_word_accuracy() {
+    let sentences = [
+        "Yesterday morning I walked through the park and noticed the leaves were changing color.",
+        "The temperature outside was around fifty degrees, which felt perfect for a long walk.",
+        "Several children were playing near the fountain while their parents watched from wooden benches.",
+        "A small brown dog ran across the path chasing after a bright red ball.",
+        "I stopped at the corner bakery and ordered a coffee with two sugars and cream.",
+        "The woman behind the counter smiled and said it would be ready in just a minute.",
+        "While waiting I noticed a newspaper headline about new technology changing how people communicate.",
+        "After finishing my drink I continued walking toward the library on the other side of town.",
+        "The library was quiet except for a few students studying at the long wooden tables near the windows.",
+        "I found a comfortable chair in the corner and opened the book I had been meaning to read for weeks.",
+        "The story was about a young scientist who discovered a way to convert sunlight into clean drinking water.",
+        "Her invention could help millions of people in remote villages who lack access to safe water supplies.",
+        "The first chapter described her childhood growing up on a farm where water was always scarce.",
+        "She remembered watching her grandmother carry heavy buckets from the well every single morning.",
+        "That memory inspired her to study chemistry and engineering at the state university.",
+        "After graduating she spent three years working in a small laboratory funded by a research grant.",
+    ];
+
+    let full_text = sentences.join(" ");
+    let expected_words: Vec<String> = normalize_words(&full_text);
+    let word_count = expected_words.len();
+    eprintln!("Test passage: {} words", word_count);
+
+    eprintln!("Generating speech via macOS TTS...");
+    let mut all_samples: Vec<f32> = Vec::new();
+    let mut sr = 0u32;
+
+    for (i, sentence) in sentences.iter().enumerate() {
+        let (samples, sample_rate) = generate_speech(sentence);
+        sr = sample_rate;
+        all_samples.extend_from_slice(&samples);
+        if i < sentences.len() - 1 {
+            all_samples.extend(vec![0.0f32; (sr as f64 * 0.3) as usize]);
+        }
+    }
+
+    let total_duration = all_samples.len() as f64 / sr as f64;
+    eprintln!("Total audio: {:.1}s at {} Hz", total_duration, sr);
+
+    // Chunk into 10-second segments (Moonshine is optimized for short audio).
+    let chunk_size = sr as usize * 10;
+    let chunks: Vec<&[f32]> = all_samples.chunks(chunk_size).collect();
+    eprintln!("Split into {} chunks of ~10s each", chunks.len());
+
+    eprintln!("Loading Moonshine Base model...");
+    let mut engine = MoonshineEngine::new().expect("Failed to load Moonshine model");
+
+    let mut transcripts: Vec<String> = Vec::new();
+    let start = std::time::Instant::now();
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let chunk_dur = chunk.len() as f64 / sr as f64;
+        eprint!("[chunk {}] {:.1}s -> ", i, chunk_dur);
+        match engine.transcribe_sync(chunk, sr, 1) {
+            Ok(text) if !text.is_empty() => {
+                eprintln!("\"{}\"", &text[..text.len().min(80)]);
+                transcripts.push(text);
+            }
+            Ok(_) => eprintln!("(empty)"),
+            Err(e) => eprintln!("error: {}", e),
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let result = transcripts.join(" ");
+
+    eprintln!(
+        "\nTotal transcription time: {:.1}s (RTF: {:.2}x)",
+        elapsed.as_secs_f64(),
+        elapsed.as_secs_f64() / total_duration,
+    );
+    eprintln!("Result: \"{}\"", result);
+
+    assert!(!result.is_empty(), "Transcription was empty");
+
+    let result_words = normalize_words(&result);
+    eprintln!(
+        "\nExpected {} words, got {} words",
+        expected_words.len(),
+        result_words.len()
+    );
+
+    let lcs_len = longest_common_subsequence(&expected_words, &result_words);
+    let accuracy = lcs_len as f64 / expected_words.len() as f64 * 100.0;
+
+    eprintln!(
+        "Word accuracy (LCS): {}/{} = {:.1}%",
+        lcs_len,
+        expected_words.len(),
+        accuracy
+    );
+
+    let result_set: std::collections::HashSet<&str> =
+        result_words.iter().map(|s| s.as_str()).collect();
+    let unique_missed: std::collections::BTreeSet<&str> = expected_words
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|w| !result_set.contains(w))
+        .collect();
+    if !unique_missed.is_empty() {
+        eprintln!("Words not found in output: {:?}", unique_missed);
+    }
+
+    assert!(
+        accuracy >= 70.0,
+        "Word accuracy too low: {:.1}% (expected >= 70%)",
+        accuracy,
+    );
+
+    eprintln!("\nPASSED: {:.1}% word accuracy", accuracy);
+}
+
+/// ~100-word transcription accuracy test with Moonshine Base.
+///
+/// Run with: cargo test --release test_moonshine_100_word_accuracy -- --ignored --nocapture
+#[test]
+#[ignore]
+fn test_moonshine_100_word_accuracy() {
+    let sentences = [
+        "Yesterday morning I walked through the park and noticed the leaves were changing color.",
+        "The temperature outside was around fifty degrees, which felt perfect for a long walk.",
+        "Several children were playing near the fountain while their parents watched from wooden benches.",
+        "A small brown dog ran across the path chasing after a bright red ball.",
+        "I stopped at the corner bakery and ordered a coffee with two sugars and cream.",
+        "The woman behind the counter smiled and said it would be ready in just a minute.",
+        "While waiting I noticed a newspaper headline about new technology changing how people communicate.",
+        "After finishing my drink I continued walking toward the library on the other side of town.",
+    ];
+
+    let full_text = sentences.join(" ");
+    let expected_words: Vec<String> = normalize_words(&full_text);
+    let word_count = expected_words.len();
+    eprintln!("Test passage: {} words", word_count);
+    eprintln!("Text: \"{}\"", full_text);
+
+    eprintln!("Generating speech via macOS TTS...");
+    let mut all_samples: Vec<f32> = Vec::new();
+    let mut sr = 0u32;
+
+    for (i, sentence) in sentences.iter().enumerate() {
+        let (samples, sample_rate) = generate_speech(sentence);
+        sr = sample_rate;
+        all_samples.extend_from_slice(&samples);
+        if i < sentences.len() - 1 {
+            all_samples.extend(vec![0.0f32; (sr as f64 * 0.3) as usize]);
+        }
+    }
+
+    let duration = all_samples.len() as f64 / sr as f64;
+    eprintln!("Total audio: {:.1}s at {} Hz", duration, sr);
+
+    eprintln!("Loading Moonshine Base model...");
+    let mut engine = MoonshineEngine::new().expect("Failed to load Moonshine model");
+
+    eprintln!("Transcribing...");
+    let start = std::time::Instant::now();
+    let result = engine
+        .transcribe_sync(&all_samples, sr, 1)
+        .expect("Transcription failed");
+    let elapsed = start.elapsed();
+
+    eprintln!("Transcribed in {:.1}s (RTF: {:.2}x)", elapsed.as_secs_f64(), elapsed.as_secs_f64() / duration);
+    eprintln!("Result: \"{}\"", result);
+
+    assert!(!result.is_empty(), "Transcription was empty");
+
+    let result_words = normalize_words(&result);
+    eprintln!("\nExpected {} words, got {} words", expected_words.len(), result_words.len());
+
+    let lcs_len = longest_common_subsequence(&expected_words, &result_words);
+    let accuracy = lcs_len as f64 / expected_words.len() as f64 * 100.0;
+
+    eprintln!("Word accuracy (LCS): {}/{} = {:.1}%", lcs_len, expected_words.len(), accuracy);
+
+    let result_set: std::collections::HashSet<&str> =
+        result_words.iter().map(|s| s.as_str()).collect();
+    let unique_missed: std::collections::BTreeSet<&str> = expected_words
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|w| !result_set.contains(w))
+        .collect();
+    if !unique_missed.is_empty() {
+        eprintln!("Words not found in output: {:?}", unique_missed);
+    }
+
+    assert!(
+        accuracy >= 70.0,
+        "Word accuracy too low: {:.1}% (expected >= 70%)",
+        accuracy,
+    );
+
+    eprintln!("\nPASSED: {:.1}% word accuracy", accuracy);
+}
+
+/// Tests Moonshine doesn't crash on silence.
+#[test]
+#[ignore]
+fn test_moonshine_silence() {
+    let mut engine = MoonshineEngine::new().expect("Failed to load Moonshine model");
+    let silence = vec![0.0f32; 16000 * 2];
+    let result = engine
+        .transcribe_sync(&silence, 16000, 1)
+        .expect("Transcription failed on silence");
+    eprintln!("Moonshine silence transcription: {:?}", result);
+    assert!(result.is_empty(), "Expected empty result for silence, got: {:?}", result);
 }

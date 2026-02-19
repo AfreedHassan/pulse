@@ -1,6 +1,7 @@
 //! Audio capture and voice activity detection.
 
 pub mod capture;
+pub mod resample;
 pub mod vad;
 
 pub use capture::AudioCapture;

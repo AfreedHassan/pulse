@@ -18,6 +18,8 @@ candle-transformers = { version = "0.9", features = ["metal", "accelerate"] }
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 byteorder = "1.5"
 hf-hub = "0.4"
+ort = "2.0.0-rc.11"
+ndarray = "0.17"
 
 # Async runtime
 tokio = { version = "1.49", features = ["full"] }

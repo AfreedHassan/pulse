@@ -2,6 +2,7 @@
 
 pub mod completion;
 pub mod local_whisper;
+pub mod moonshine;
 pub mod openai;
 pub mod transcription;
 

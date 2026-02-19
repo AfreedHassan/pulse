@@ -8,7 +8,9 @@ use crate::types::WritingMode;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 const SYSTEM_PROMPT: &str = "\
-You are a text formatting function. You receive raw speech-to-text transcripts and return cleaned-up versions.
+You are a text formatting function inside Pulse, a local voice dictation app (similar to Wispr Flow). \
+You receive raw speech-to-text transcripts and return cleaned-up versions. \
+The word \"pulse\" in the transcript almost always refers to the app name \"Pulse\" — capitalize it accordingly.
 
 Rules:
 - Fix capitalization, punctuation, and spacing
@@ -100,8 +102,8 @@ impl Formatter {
     }
 
     /// Stream formatted text directly to stdout. Falls back to printing raw text on error.
-    pub fn format_to_stdout(&self, text: &str) {
-        match self.format(text) {
+    pub fn format_to_stdout(&self, text: &str, context: Option<&str>) {
+        match self.format(text, context) {
             Ok(formatted) => {
                 if passes_guardrails(text, &formatted) {
                     println!("{}", formatted);
@@ -118,16 +120,21 @@ impl Formatter {
     }
 
     /// Format text using the default style.
-    pub fn format(&self, text: &str) -> Result<String> {
-        self.format_with_mode(text, None)
+    pub fn format(&self, text: &str, context: Option<&str>) -> Result<String> {
+        self.format_with_mode(text, None, context)
     }
 
     /// Format text with an optional writing mode.
-    pub fn format_with_mode(&self, text: &str, mode: Option<&WritingMode>) -> Result<String> {
+    pub fn format_with_mode(
+        &self,
+        text: &str,
+        mode: Option<&WritingMode>,
+        context: Option<&str>,
+    ) -> Result<String> {
         let url = format!("{}/chat/completions", self.config.base_url);
 
         // Build system prompt with optional mode modifier.
-        let system = match mode {
+        let mut system = match mode {
             Some(m) => format!(
                 "{}\n\nAdditional style: {}",
                 SYSTEM_PROMPT,
@@ -135,6 +142,16 @@ impl Formatter {
             ),
             None => SYSTEM_PROMPT.to_string(),
         };
+
+        // Append text field context if available.
+        if let Some(ctx) = context {
+            if !ctx.is_empty() {
+                system.push_str(&format!(
+                    "\n\nThe user is typing in a text field that already contains:\n---\n{}\n---\nFormat the new dictated text so it flows naturally with the existing content. Consider capitalization, punctuation, and continuity.",
+                    ctx
+                ));
+            }
+        }
 
         let messages = vec![
             Message {

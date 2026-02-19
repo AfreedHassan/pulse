@@ -79,7 +79,7 @@ fn test_guardrails_preserves_numbers() {
 fn test_formatter_prose() {
     let f = make_formatter();
     let input = "so i was thinking we could maybe go to the store tomorrow and pick up some stuff for the party";
-    let result = f.format(input).expect("format failed");
+    let result = f.format(input, None).expect("format failed");
     eprintln!("Input:  {}", input);
     eprintln!("Output: {}", result);
 
@@ -107,7 +107,7 @@ fn test_formatter_prose() {
 fn test_formatter_grocery_list() {
     let f = make_formatter();
     let input = "So I need to get a dozen eggs a dozen bananas some apples and a kilogram of flour tomorrow. That's my grocery list.";
-    let result = f.format(input).expect("format failed");
+    let result = f.format(input, None).expect("format failed");
     eprintln!("Input:  {}", input);
     eprintln!("Output: {}", result);
 
@@ -138,7 +138,7 @@ fn test_formatter_grocery_list() {
 fn test_formatter_numbered_steps() {
     let f = make_formatter();
     let input = "okay there are three things we need to do first we need to fix the login bug second we need to update the docs and third we need to deploy to staging";
-    let result = f.format(input).expect("format failed");
+    let result = f.format(input, None).expect("format failed");
     eprintln!("Input:  {}", input);
     eprintln!("Output: {}", result);
 
@@ -160,7 +160,7 @@ fn test_formatter_numbered_steps() {
 fn test_formatter_does_not_answer_questions() {
     let f = make_formatter();
     let input = "can you help me figure out what to do about the database migration";
-    let result = f.format(input).expect("format failed");
+    let result = f.format(input, None).expect("format failed");
     eprintln!("Input:  {}", input);
     eprintln!("Output: {}", result);
 
@@ -194,7 +194,7 @@ fn test_formatter_self_correction() {
     let f = make_formatter();
     let input =
         "hey john can we meet at 6pm tomorrow uh no scratch that lets meet at 10pm tomorrow";
-    let result = f.format(input).expect("format failed");
+    let result = f.format(input, None).expect("format failed");
     eprintln!("Input:  {}", input);
     eprintln!("Output: {}", result);
 
@@ -229,7 +229,7 @@ fn test_formatter_self_correction() {
 fn test_formatter_short_input() {
     let f = make_formatter();
     let input = "hello";
-    let result = f.format(input).expect("format failed");
+    let result = f.format(input, None).expect("format failed");
     eprintln!("Input:  {}", input);
     eprintln!("Output: {}", result);
 
@@ -252,7 +252,7 @@ fn test_formatter_with_mode_formal() {
     let f = make_formatter();
     let input = "gonna grab some food";
     let result = f
-        .format_with_mode(input, Some(&WritingMode::Formal))
+        .format_with_mode(input, Some(&WritingMode::Formal), None)
         .expect("format failed");
     eprintln!("Input:  {}", input);
     eprintln!("Output: {}", result);
@@ -275,7 +275,7 @@ fn test_formatter_with_mode_casual() {
     let f = make_formatter();
     let input = "i am going to the store";
     let result = f
-        .format_with_mode(input, Some(&WritingMode::Casual))
+        .format_with_mode(input, Some(&WritingMode::Casual), None)
         .expect("format failed");
     eprintln!("Input:  {}", input);
     eprintln!("Output: {}", result);
@@ -293,7 +293,7 @@ fn test_formatter_with_mode_very_casual() {
     let f = make_formatter();
     let input = "sorry about that";
     let result = f
-        .format_with_mode(input, Some(&WritingMode::VeryCasual))
+        .format_with_mode(input, Some(&WritingMode::VeryCasual), None)
         .expect("format failed");
     eprintln!("Input:  {}", input);
     eprintln!("Output: {}", result);
@@ -311,7 +311,7 @@ fn test_formatter_with_mode_excited() {
     let f = make_formatter();
     let input = "that is so cool";
     let result = f
-        .format_with_mode(input, Some(&WritingMode::Excited))
+        .format_with_mode(input, Some(&WritingMode::Excited), None)
         .expect("format failed");
     eprintln!("Input:  {}", input);
     eprintln!("Output: {}", result);

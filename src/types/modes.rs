@@ -30,8 +30,11 @@ impl WritingMode {
                  the reformatted text."
             }
             Self::VeryCasual => {
-                "Reformat in casual texting style. Use lowercase, abbreviations like \"gonna\", \
-                 \"rn\", \"sry\". Keep it brief and informal like a text to a close friend. \
+                "Reformat in casual texting style. Use all lowercase except for proper nouns \
+                 (names, places, brands). Minimal punctuation — skip periods at the end of \
+                 messages, skip commas unless needed for clarity. Use abbreviations like \
+                 \"gonna\", \"rn\", \"sry\". Keep it brief and informal like a plain text to \
+                 a close friend. \
                  Output EXACTLY as it would be typed—nothing else."
             }
             Self::Excited => {

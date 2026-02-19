@@ -4,26 +4,52 @@
 //! or run without arguments for interactive recording mode.
 //! Add `--paste` to paste transcribed text into the frontmost app.
 //! Add `--model fast|balanced|quality` to pick model tier (default: fast).
+//! Add `--provider moonshine` to use Moonshine Base instead of Whisper.
 
-use pulse::audio::{AudioCapture, SimpleVad, VoiceActivity, VAD_CHUNK_SIZE};
+use pulse::audio::AudioCapture;
 use pulse::engine::formatter::{self, Formatter, FormatterConfig};
-use pulse::platform::{hotkey, paste};
+use pulse::platform::{accessibility, apps, hotkey, paste};
+use pulse::types::WritingMode;
 use pulse::providers::local_whisper::{PulseEngine, PulseModel};
+use pulse::providers::moonshine::MoonshineEngine;
 use pulse::read_wav;
 use std::io::{self, Read};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// Minimum utterance length before we bother transcribing.
-const MIN_CHUNK_SAMPLES: usize = 8_000; // 0.5s at 16kHz
+/// How often to drain the audio buffer and dispatch for transcription.
+const CHUNK_INTERVAL: Duration = Duration::from_secs(5);
 
-/// How often to poll the audio buffer for VAD.
-const VAD_POLL_INTERVAL: Duration = Duration::from_millis(32);
+/// Minimum samples before dispatching a chunk (0.5s at 16kHz).
+const MIN_CHUNK_SAMPLES: usize = 8_000;
+
+/// How often to check for stop triggers while recording.
+const POLL_INTERVAL: Duration = Duration::from_millis(32);
 
 fn audio_duration_secs(num_samples: usize, sample_rate: u32, channels: u16) -> f64 {
     num_samples as f64 / (sample_rate as f64 * channels as f64)
+}
+
+/// Unified engine dispatching to either Whisper or Moonshine.
+enum Engine {
+    Whisper(PulseEngine),
+    Moonshine(MoonshineEngine),
+}
+
+impl Engine {
+    fn transcribe_sync(
+        &mut self,
+        pcm: &[f32],
+        sample_rate: u32,
+        channels: u16,
+    ) -> pulse::Result<String> {
+        match self {
+            Engine::Whisper(e) => e.transcribe_sync(pcm, sample_rate, channels),
+            Engine::Moonshine(e) => e.transcribe_sync(pcm, sample_rate, channels),
+        }
+    }
 }
 
 fn main() {
@@ -35,7 +61,14 @@ fn main() {
         eprintln!("Paste mode enabled (will paste into frontmost app)");
     }
 
-    // Parse model tier (default: fast).
+    // Parse provider (default: whisper).
+    let provider = args
+        .windows(2)
+        .find(|w| w[0] == "--provider")
+        .map(|w| w[1].as_str())
+        .unwrap_or("whisper");
+
+    // Parse model tier (default: fast). Only used for Whisper.
     let model_tier = args
         .windows(2)
         .find(|w| w[0] == "--model")
@@ -47,16 +80,33 @@ fn main() {
         Formatter::new(cfg)
     });
 
-    // Load engine.
-    eprintln!("Loading Pulse model ({})...", model_tier);
-    let engine = match PulseEngine::new(model_tier) {
-        Ok(e) => {
-            eprintln!("✓ Model loaded successfully.");
-            Arc::new(Mutex::new(e))
+    // Load engine based on provider selection.
+    let engine = match provider {
+        "moonshine" => {
+            eprintln!("Loading Moonshine Base model...");
+            match MoonshineEngine::new() {
+                Ok(e) => {
+                    eprintln!("✓ Moonshine model loaded successfully.");
+                    Arc::new(Mutex::new(Engine::Moonshine(e)))
+                }
+                Err(e) => {
+                    eprintln!("✗ Failed to load Moonshine model: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
-        Err(e) => {
-            eprintln!("✗ Failed to load model: {}", e);
-            std::process::exit(1);
+        _ => {
+            eprintln!("Loading Pulse model ({})...", model_tier);
+            match PulseEngine::new(model_tier) {
+                Ok(e) => {
+                    eprintln!("✓ Model loaded successfully.");
+                    Arc::new(Mutex::new(Engine::Whisper(e)))
+                }
+                Err(e) => {
+                    eprintln!("✗ Failed to load model: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
     };
 
@@ -73,18 +123,29 @@ fn main() {
 }
 
 fn emit_text(text: &str, fmt: Option<&Formatter>, paste_mode: bool) {
+    let (context, writing_mode) = if paste_mode {
+        let ctx = accessibility::read_focused_text_field();
+        let mode = apps::detect_frontmost_app()
+            .map(|app| WritingMode::suggested_for_category(app.category));
+        (ctx, mode)
+    } else {
+        (None, None)
+    };
+
     let output = match fmt {
-        Some(f) => match f.format(text) {
-            Ok(formatted) if formatter::passes_guardrails(text, &formatted) => formatted,
-            Ok(_) => {
-                eprintln!("Formatter produced bad output, using raw text");
-                text.to_string()
+        Some(f) => {
+            match f.format_with_mode(text, writing_mode.as_ref(), context.as_deref()) {
+                Ok(formatted) if formatter::passes_guardrails(text, &formatted) => formatted,
+                Ok(_) => {
+                    eprintln!("Formatter produced bad output, using raw text");
+                    text.to_string()
+                }
+                Err(e) => {
+                    eprintln!("Formatter error (using raw text): {}", e);
+                    text.to_string()
+                }
             }
-            Err(e) => {
-                eprintln!("Formatter error (using raw text): {}", e);
-                text.to_string()
-            }
-        },
+        }
         None => text.to_string(),
     };
 
@@ -100,7 +161,7 @@ fn emit_text(text: &str, fmt: Option<&Formatter>, paste_mode: bool) {
 
 fn run_file_mode(
     path: &str,
-    engine: &Arc<Mutex<PulseEngine>>,
+    engine: &Arc<Mutex<Engine>>,
     fmt: Option<&Formatter>,
     paste_mode: bool,
 ) {
@@ -129,7 +190,7 @@ fn run_file_mode(
     }
 }
 
-fn run_interactive_mode(engine: &Arc<Mutex<PulseEngine>>, fmt: Option<&Formatter>, paste_mode: bool) {
+fn run_interactive_mode(engine: &Arc<Mutex<Engine>>, fmt: Option<&Formatter>, paste_mode: bool) {
     let audio = AudioCapture::new();
     let sample_rate = audio.sample_rate();
     let channels = audio.channels();
@@ -154,15 +215,11 @@ fn run_interactive_mode(engine: &Arc<Mutex<PulseEngine>>, fmt: Option<&Formatter
         enter_rx
     };
 
-    let mut vad = SimpleVad::new();
-
-    // Scale VAD chunk size and minimum utterance length to the device's native sample rate.
-    // VAD_CHUNK_SIZE (512) is calibrated for 16kHz (~32ms window).
-    // MIN_CHUNK_SAMPLES (32000) is 2s at 16kHz.
+    // Scale minimum chunk size to the device's native sample rate.
+    // MIN_CHUNK_SAMPLES (8000) is 0.5s at 16kHz.
     // At 48kHz we need 3x more samples for the same duration.
-    let rate_scale = sample_rate as usize / 16_000;
-    let vad_chunk = VAD_CHUNK_SIZE * rate_scale.max(1);
-    let min_chunk = MIN_CHUNK_SAMPLES * rate_scale.max(1);
+    let rate_scale = (sample_rate as usize / 16_000).max(1);
+    let min_chunk = MIN_CHUNK_SAMPLES * rate_scale;
 
     loop {
         // Wait for trigger to start.
@@ -175,39 +232,31 @@ fn run_interactive_mode(engine: &Arc<Mutex<PulseEngine>>, fmt: Option<&Formatter
         // Clear any queued triggers.
         while trigger_rx.try_recv().is_ok() {}
         audio.start();
-        vad.reset();
 
-        // VAD loop: monitor audio while recording, transcribe completed utterances.
-        // Transcription runs on a background thread so VAD polling continues
-        // uninterrupted — this prevents missing words right after boundaries.
-        let (chunk_tx, result_rx) = mpsc::channel::<String>();
+        // Timer-based chunking: drain the audio buffer every CHUNK_INTERVAL
+        // and dispatch to a background transcription thread.
+        let (result_tx, result_rx) = mpsc::channel::<String>();
+        let (work_tx, work_rx) = mpsc::channel::<(Vec<f32>, u32, u16)>();
         let engine_ref = Arc::clone(&engine);
-        let transcribe_handle = {
-            let chunk_tx = chunk_tx;
-            let (work_tx, work_rx) = mpsc::channel::<(Vec<f32>, u32, u16)>();
 
-            let handle = thread::spawn(move || {
-                let mut eng = engine_ref.lock().unwrap();
-                while let Ok((chunk, sr, ch)) = work_rx.recv() {
-                    let dur = chunk.len() as f64 / (sr as f64 * ch as f64);
-                    eprintln!("[vad] Transcribing utterance ({:.1}s)...", dur);
-                    match eng.transcribe_sync(&chunk, sr, ch) {
-                        Ok(text) if !text.is_empty() => {
-                            eprintln!("[vad] → \"{}\"", &text[..text.len().min(80)]);
-                            let _ = chunk_tx.send(text);
-                        }
-                        Ok(_) => eprintln!("[vad] (silence/empty)"),
-                        Err(e) => eprintln!("[vad] Transcription error: {}", e),
+        let transcribe_thread = thread::spawn(move || {
+            let mut eng = engine_ref.lock().unwrap();
+            while let Ok((chunk, sr, ch)) = work_rx.recv() {
+                let dur = chunk.len() as f64 / (sr as f64 * ch as f64);
+                eprintln!("[chunk] Transcribing {:.1}s...", dur);
+                match eng.transcribe_sync(&chunk, sr, ch) {
+                    Ok(text) if !text.is_empty() => {
+                        eprintln!("[chunk] -> \"{}\"", &text[..text.len().min(80)]);
+                        let _ = result_tx.send(text);
                     }
+                    Ok(_) => eprintln!("[chunk] (silence/empty)"),
+                    Err(e) => eprintln!("[chunk] Transcription error: {}", e),
                 }
-            });
-
-            // Send chunks via work_tx, results come back via result_rx.
-            (work_tx, handle)
-        };
-        let (work_tx, transcribe_thread) = transcribe_handle;
+            }
+        });
 
         let mut samples_consumed: usize = 0;
+        let mut last_drain = Instant::now();
 
         loop {
             // Check for trigger to stop.
@@ -215,26 +264,19 @@ fn run_interactive_mode(engine: &Arc<Mutex<PulseEngine>>, fmt: Option<&Formatter
                 break;
             }
 
-            thread::sleep(VAD_POLL_INTERVAL);
+            thread::sleep(POLL_INTERVAL);
 
-            // Peek at the tail of the live buffer for VAD.
-            let tail = audio.peek_tail(vad_chunk);
-            if tail.is_empty() {
-                continue;
-            }
-
-            let (state, changed) = vad.update(&tail);
-
-            if changed && state == VoiceActivity::Silence {
-                // Utterance boundary! Drain and send to background transcriber.
-                let current_len = audio.live_len();
-                let drain_count = current_len.saturating_sub(vad_chunk);
-                if drain_count > min_chunk {
-                    let chunk = audio.drain(drain_count);
-                    eprintln!("[vad] Utterance boundary, dispatching...");
+            // Every CHUNK_INTERVAL, drain the buffer and dispatch for transcription.
+            if last_drain.elapsed() >= CHUNK_INTERVAL {
+                let available = audio.live_len();
+                if available > min_chunk {
+                    let chunk = audio.drain(available);
+                    eprintln!("[chunk] Dispatching {:.1}s of audio...",
+                        audio_duration_secs(chunk.len(), sample_rate, channels));
+                    samples_consumed += chunk.len();
                     let _ = work_tx.send((chunk, sample_rate, channels));
-                    samples_consumed += drain_count;
                 }
+                last_drain = Instant::now();
             }
         }
 
