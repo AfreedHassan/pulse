@@ -1,0 +1,219 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pulse</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <div id="app">
+
+      <!-- Sidebar -->
+      <aside id="sidebar">
+        <div class="sidebar-top">
+          <div class="sidebar-logo">
+            <span class="logo-text">Pulse</span>
+            <span class="logo-badge">LOCAL</span>
+          </div>
+
+          <nav class="sidebar-nav">
+            <button class="nav-item active" data-nav="transcript">
+              <svg class="nav-icon" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M2.25 12l8.954-8.955a1.126 1.126 0 011.591 0L21.75 12M4.5 9.75v10.125c0 .621.504 1.125 1.125 1.125H9.75v-4.875c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125V21h4.125c.621 0 1.125-.504 1.125-1.125V9.75M8.25 21h8.25"/></svg>
+              Home
+            </button>
+            <button class="nav-item" data-nav="settings">
+              <svg class="nav-icon" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M10.5 21h3M12 18a6 6 0 006-6v-1.5M12 18a6 6 0 01-6-6v-1.5M12 18v3M9 3.515A3 3 0 0112 1.5a3 3 0 013 2.015M6 7.5a6 6 0 0112 0"/></svg>
+              Dictionary
+            </button>
+            <button class="nav-item" data-nav="style">
+              <svg class="nav-icon" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L10.582 16.07a4.5 4.5 0 01-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 011.13-1.897l8.932-8.931zM16.862 4.487L19.5 7.125"/></svg>
+              Style
+            </button>
+            <button class="nav-item" data-nav="help">
+              <svg class="nav-icon" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/></svg>
+              Notes
+            </button>
+          </nav>
+        </div>
+
+        <div class="sidebar-bottom">
+          <div class="sidebar-model-info">
+            <label>Provider</label>
+            <div class="custom-select" id="provider-dropdown">
+              <button class="custom-select-trigger" id="provider-trigger">
+                <span class="custom-select-value">CoreML Whisper</span>
+                <svg class="custom-select-chevron" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+              <div class="custom-select-menu">
+                <div class="custom-select-option" data-value="Whisper">Whisper</div>
+                <div class="custom-select-option" data-value="Moonshine">Moonshine</div>
+                <div class="custom-select-option selected" data-value="CoreML">CoreML Whisper</div>
+              </div>
+            </div>
+            <label>Model</label>
+            <div class="custom-select hidden" id="model-dropdown">
+              <button class="custom-select-trigger" id="model-trigger">
+                <span class="custom-select-value">Large (1.5G)</span>
+                <svg class="custom-select-chevron" width="10" height="6" viewBox="0 0 10 6" fill="none"><path d="M1 1L5 5L9 1" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+              <div class="custom-select-menu">
+                <div class="custom-select-option" data-value="tiny">Tiny (39M)</div>
+                <div class="custom-select-option" data-value="base">Base (74M)</div>
+                <div class="custom-select-option" data-value="small">Small (244M)</div>
+                <div class="custom-select-option" data-value="medium">Medium (769M)</div>
+                <div class="custom-select-option selected" data-value="large">Large (1.5G)</div>
+                <div class="custom-select-option" data-value="distil-large-v3">Distil Large v3</div>
+                <div class="custom-select-option" data-value="turbo">Turbo</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="sidebar-record-section">
+            <div class="status-row">
+              <span id="status-dot" class="status-dot"></span>
+              <span id="status-text" class="status-label">Select a model to begin</span>
+              <span id="timer-text" class="timer-text hidden">00:00.0</span>
+            </div>
+            <button id="record-btn" disabled class="record-btn">Record</button>
+            <div class="level-bar-container">
+              <div id="level-bar" class="level-bar" style="width: 0%"></div>
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Main Content -->
+      <main id="main-content">
+
+        <!-- Transcript Panel (Home) -->
+        <div id="transcript-panel" class="panel">
+          <div class="welcome-section">
+            <h1 class="welcome-title">Welcome back</h1>
+            <div class="stats-row">
+              <div class="stat-item">
+                <span class="stat-value" id="stat-sessions">0</span>
+                <span class="stat-label">sessions</span>
+              </div>
+              <div class="stat-item">
+                <span class="stat-value" id="stat-words">0</span>
+                <span class="stat-label">words</span>
+              </div>
+              <div class="stat-item">
+                <span class="stat-value" id="stat-time">0s</span>
+                <span class="stat-label">recorded</span>
+              </div>
+            </div>
+          </div>
+
+          <div id="promo-card" class="promo-card">
+            <p class="promo-text"><strong>Tip:</strong> Enable paste mode in Settings to automatically insert transcriptions into your frontmost app.</p>
+          </div>
+
+          <div id="empty-state" class="empty-state">
+            <svg class="empty-icon" fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 01-3-3V4.5a3 3 0 116 0v8.25a3 3 0 01-3 3z"/></svg>
+            <p>Press Record or use hotkey to begin</p>
+          </div>
+
+          <div id="history-container" class="history-container hidden"></div>
+
+          <div id="live-container" class="live-container hidden">
+            <div class="live-header">
+              <span class="live-dot recording-dot"></span>
+              <span class="live-label">Live</span>
+            </div>
+            <p id="live-text" class="live-text"></p>
+          </div>
+        </div>
+
+        <!-- Settings Panel (Dictionary) -->
+        <div id="settings-panel" class="panel hidden">
+          <h2 class="panel-title">Settings</h2>
+
+          <div class="settings-section">
+            <h3 class="settings-heading">Behavior</h3>
+            <div class="settings-group">
+              <label class="setting-label">
+                <input id="paste-mode-cb" type="checkbox" class="setting-checkbox" />
+                <span>Paste mode (insert text into frontmost app)</span>
+              </label>
+              <label class="setting-label">
+                <input id="hotkey-cb" type="checkbox" class="setting-checkbox" />
+                <span>Enable Fn/Globe hotkey</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <h3 class="settings-heading">LLM Formatter</h3>
+            <div class="settings-group">
+              <input id="llm-url" type="text" placeholder="Base URL (e.g. http://localhost:11434/v1)" class="settings-input" />
+              <input id="llm-key" type="password" placeholder="API Key (optional)" class="settings-input" />
+              <input id="llm-model" type="text" placeholder="Model name (e.g. gpt-4o-mini)" class="settings-input" />
+            </div>
+          </div>
+        </div>
+
+        <!-- Style Panel (Writing Mode) -->
+        <div id="style-panel" class="panel hidden">
+          <h2 class="panel-title">Writing Style</h2>
+
+          <div class="settings-section">
+            <h3 class="settings-heading">Writing Mode</h3>
+            <div class="writing-mode-grid" id="writing-mode-grid">
+              <button data-mode="formal" class="writing-mode-btn">Formal</button>
+              <button data-mode="casual" class="writing-mode-btn active">Casual</button>
+              <button data-mode="very_casual" class="writing-mode-btn">Very Casual</button>
+              <button data-mode="excited" class="writing-mode-btn">Excited</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Help Panel (Notes) -->
+        <div id="help-panel" class="panel hidden">
+          <h2 class="panel-title">Help & Notes</h2>
+
+          <div class="settings-section">
+            <h3 class="settings-heading">How to Use</h3>
+            <ul class="help-list">
+              <li>Select a provider and model, then wait for it to load</li>
+              <li>Click <strong>Record</strong> or press the <strong>Fn/Globe</strong> key</li>
+              <li>Speak naturally — transcription happens in real time</li>
+              <li>Click <strong>Stop</strong> or release the hotkey to finish</li>
+              <li>With <strong>Paste mode</strong>, text is inserted into your frontmost app</li>
+            </ul>
+          </div>
+
+          <div class="settings-section">
+            <h3 class="settings-heading">Providers</h3>
+            <ul class="help-list">
+              <li><strong>Whisper</strong> — OpenAI Whisper via Candle (Metal GPU accelerated)</li>
+              <li><strong>Moonshine</strong> — Lightweight, fast model for quick transcription</li>
+              <li><strong>CoreML Whisper</strong> — Apple CoreML optimized Whisper</li>
+            </ul>
+          </div>
+
+          <div class="settings-section">
+            <h3 class="settings-heading">Pipeline</h3>
+            <ul class="help-list">
+              <li>Audio captured from mic via push-to-talk</li>
+              <li>VAD splits audio into utterance chunks</li>
+              <li>Resampled to 16kHz mono PCM</li>
+              <li>Whisper inference produces raw transcription</li>
+              <li>Optional LLM formatter cleans up text with guardrails</li>
+              <li>Final text output to clipboard or frontmost app</li>
+            </ul>
+          </div>
+        </div>
+
+        <!-- Loading Overlay -->
+        <div id="loading-overlay" class="loading-overlay hidden">
+          <div class="loading-spinner"></div>
+          <p id="loading-text" class="loading-label">Loading model...</p>
+        </div>
+      </main>
+
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
