@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default capabilities for Pulse","local":true,"windows":["main"],"permissions":["core:default","core:window:allow-close","core:window:allow-set-size","core:window:allow-set-focus","shell:allow-open"]}}
