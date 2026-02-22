@@ -1,6 +1,22 @@
+# Build artifacts
 /target
+**/*.build
+
+# Dependencies
+node_modules/
+
+# Environment & secrets
 .env
-*.wav
-project.lua
+
+# macOS
 .DS_Store
+
+# Editor / project files
+project.lua
 CLAUDE.md
+
+# Audio files
+*.wav
+
+# Reference implementation (not part of Pulse)
+inspo-flow
