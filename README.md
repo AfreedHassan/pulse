@@ -40,29 +40,43 @@ CoreML model compilation happens once on first use (takes 1-2 minutes, produces 
 
 ## How It Works
 
-### Audio Pipeline
+```mermaid
+flowchart TD
+    User(("User\nHold Fn/Globe"))
+    User --> Mic
 
-Pulse captures audio via `cpal` using a double-buffered architecture. The mic callback thread writes samples into a "live" buffer. When recording stops, buffers are exchanged with `mem::swap` -- a pointer swap, not a copy. The consumer thread then processes the "ready" buffer: convert to mono, resample to 16kHz, and feed into whichever inference backend is active.
+    subgraph Audio["Audio Pipeline"]
+        Mic["Mic Capture (cpal)"]
+        Mic --> Live["Live Buffer\n(writing)"]
+        Live <-->|"mem::swap\n(zero-copy pointer swap)"| Ready["Ready Buffer\n(processing)"]
+    end
 
-All buffers are pre-allocated at startup for 30 seconds of audio. The recording loop makes zero heap allocations.
+    Ready --> VAD["VAD — detect silence boundaries"]
+    VAD -->|"chunked 16kHz mono"| Whisper
 
-### Voice Activity Detection
+    subgraph Inference["Whisper Inference"]
+        direction LR
+        Whisper["Candle / Metal GPU"]
+        Whisper2["ONNX / CoreML EP"]
+        Whisper3["WhisperKit / ANE"]
+    end
 
-An energy-based VAD with hysteresis runs during capture, detecting utterance boundaries in real time. This enables chunked transcription -- Pulse begins returning text while you are still speaking, rather than waiting for the full recording to finish.
+    Inference -->|raw text| Post
 
-### Post-Processing Pipeline
+    subgraph Post["Post-Processing"]
+        direction LR
+        P1["Corrections"] --> P2["Shortcuts"] --> P3["Contacts"] --> P4["LLM + Guardrails"]
+    end
 
-Raw transcriptions pass through a series of processing stages:
+    Post -->|final text| Paste["Paste into Frontmost App"]
+    Paste --> DB[("SQLite")]
+```
 
-1. **Learned corrections** -- previously corrected mistakes are applied automatically
-2. **Shortcut expansion** -- abbreviations like "brb" expand to "be right back"
-3. **Contact name resolution** -- proper noun capitalization from your contacts
-4. **Context-aware formatting** -- Pulse detects the frontmost app and adjusts output style (formal for email, casual for messaging)
-5. **LLM formatting** -- optional polishing via an OpenAI-compatible API, with guardrail validation that rejects outputs that hallucinate or deviate from the transcription
+Audio is captured via `cpal` into pre-allocated double buffers (zero heap allocations in the recording loop). An energy-based VAD with hysteresis detects utterance boundaries, splitting audio into chunks that are transcribed in parallel while the user is still speaking. Each chunk is converted to mono, resampled to 16kHz, and passed to whichever inference backend is active.
 
-### Storage
+Raw transcriptions pass through five post-processing stages: learned corrections, shortcut expansion, contact name resolution, context-aware formatting (adapts style to the frontmost app), and optional LLM polishing with guardrail validation.
 
-Transcription history, learned corrections, shortcuts, contacts, and settings persist in a local SQLite database at `~/.local/share/pulse/pulse.db`. Schema migrations run automatically on startup.
+Transcription history, corrections, shortcuts, and settings persist in a local SQLite database at `~/.local/share/pulse/pulse.db`.
 
 ## Desktop App
 
@@ -126,6 +140,21 @@ src/                      Frontend (TypeScript, Vite, Tailwind CSS)
 ```
 
 The core library is independent of the desktop app and works as a standalone Rust crate or CLI tool. The Tauri app imports it as a dependency.
+
+## Benchmarks
+
+Measured on Apple M3 Pro with VAD-chunked transcription of 7 natural sentences (~31s of speech, 101 words). Both backends use the Large v3 (1.5B parameter) model.
+
+| Metric | Whisper/Candle (Metal GPU) | WhisperKit/CoreML (ANE) |
+|--------|---------------------------|-------------------------|
+| Total inference time | 10.7s | 8.8s |
+| Final chunk latency | 1547ms | 1084ms |
+| Avg chunk latency | 1526ms | 975ms |
+| Real-time factor (RTF) | 0.34x | 0.28x |
+| Effective RTF (user wait) | 0.049x | 0.034x |
+| Word accuracy | 98.3% | 98.0% |
+
+**RTF** is total inference time divided by total speech duration. **Effective RTF** is the user-perceived wait -- only the final chunk's latency matters, since earlier chunks are transcribed in parallel while the user is still speaking.
 
 ## Tests
 
